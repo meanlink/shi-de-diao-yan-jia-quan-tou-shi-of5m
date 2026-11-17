@@ -4,7 +4,18 @@
 
 ## 模块与业务流程
 数据接入（JSON/CSV、字段验证、批次指纹）→ 参数化分析（异步 Python worker）→ 结果复核（指标、图形、明细、解释、批准）→ 定时分发（本地收件箱、CSV/JSON、SHA256）；另有业务总览和审计轨迹。
-三个贯穿全栈的实体：Dataset 数据批次、Job 分析任务、Report 分发计划；辅助 User、Audit、Delivery。
+三个贯穿全栈的实体：Dataset 数据批次、Job 分析任务、Report 分发计划；辅助 User、Audit、Delivery。派工调度是该链路上的独立一层，见下。
+
+## 派工调度（按发起人轮转）
+连续提交会挤占他人，因此排队不按任务先来后到，而是按**发起人**轮转：
+
+- 每名发起人每轮领取一项，个人任务仍按受理顺序处理；本轮无任务的发起人跳过，不阻塞他人。
+- 新来者加入当前循环的末尾，不会插到更早提交者之前。
+- 管理员可设**全站运行名额**（`SITE_CAPACITY`，1–8，默认 1）。调低名额不打断在途分析，只有空位出现才派下一项。
+- 派工记录（`job_events`）、轮转游标（`scheduler_state`）与任务领取在同一事务中写入，派工依据与领取结果始终一致。
+- 轮转进度与未完任务持久化在 `scheduler_state` / `jobs`，重启后从原游标继续；中断任务转为「待恢复」，恢复后回到原轮次重试，不会重复派工，也不会额外多给发起人一轮。
+- 每个领取带独立凭据与租约；执行者失联后任务转「待恢复」，失联者的晚回结果因凭据不符被拒收并留痕。
+- 「派工调度台」（`#/dispatch`）可查等待次序、占位任务、轮转位置与每一次派工的依据；任务详情页给出从排队到占位、完成或待恢复的完整轨迹。历史成功结果与简报照常可用。
 
 ## 快速启动
 ```bash
@@ -29,11 +40,11 @@ Python 3.12 / FastAPI / SQLAlchemy / NumPy / SciPy / scikit-learn；PostgreSQL 1
 ## 目录与工程约定
 backend/src/{models,schemas,services,routes,controllers,middlewares,constants,config,utils}；backend/scripts/seed_demo.py；backend/migrations/initial.py。
 frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}。
-Role 枚举：admin/analyst/viewer；JobStatus：queued/running/completed/failed。后端 backend/src/constants/enums.py，前端 frontend/src/constants/enums.js；路由权限在 middlewares/auth.py；页面按相同角色控制操作入口。
+Role 枚举：admin/analyst/viewer；JobStatus：queued/running/recovering/completed/failed。后端 backend/src/constants/enums.py，前端 frontend/src/constants/enums.js；路由权限在 middlewares/auth.py；页面按相同角色控制操作入口。派工逻辑集中在 backend/src/services/scheduling.py，调度台页面为 frontend/src/pages/dispatch.js。
 
 ## 环境变量与 Docker
-COMPOSE_PROJECT_NAME=survey-pivot；FRONTEND_PORT=18218；BACKEND_PORT=19218；DB_PORT=17718；DB_PASSWORD、JWT_SECRET 见 .env.example；SEED_DEMO 默认 true。共享命名产物卷供后端下载与 worker 写入，数据库/Redis 各持久卷。
-恰好五服务均有健康检查。Redis 队列加 SQL 排队状态兜底；worker 按 next_run 生成本地收件箱文件。周期 60 秒至 30 天。分发结果为批准分析的固定快照；若需新数据重新计算并建立新计划。当前不连接邮件或企业聊天。
+COMPOSE_PROJECT_NAME=survey-pivot；FRONTEND_PORT=18218；BACKEND_PORT=19218；DB_PORT=17718；DB_PASSWORD、JWT_SECRET 见 .env.example；SEED_DEMO 默认 true。共享命名产物卷供后端下载与 worker 写入，数据库/Redis 各持久卷。派工相关：`SITE_CAPACITY` 初始全站名额（1–8，默认 1，管理员可在调度台调整）、`JOB_LEASE_SECONDS` 领取租约秒数（默认 30）。
+恰好五服务均有健康检查。Redis 队列只负责唤醒；worker 以 SQL 中的排队状态为耐久依据按轮转派工，并写入本地收件箱文件。周期 60 秒至 30 天。分发结果为批准分析的固定快照；若需新数据重新计算并建立新计划。当前不连接邮件或企业聊天。
 错误响应、请求编号、Redis 每 IP 每分钟 240 次限流、JWT 和数据库操作审计。演示密钥与密码仅供本机模拟；生产部署前配置独立密钥与账号。
 
 ## 数据与验收
